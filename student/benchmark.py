@@ -9,6 +9,10 @@ Warmup comparison (for writeup): run with --compare_warmup to get a table for
 warmup=0, 1, 2, 5. Example:
   uv run python -m student.benchmark --compare_warmup --size small
   uv run python -m student.benchmark --compare_warmup --output warmup.csv --latex
+
+Nsight Systems (§1.1.4): run under nsys with NVTX ranges to filter warmup/forward/backward:
+  uv run nsys profile -o result.nsys-rep --stats=true python -m student.benchmark --size small --nvtx
+  uv run nsys profile -o result.nsys-rep python -m student.benchmark --size small --nvtx --nvtx_attention
 """
 
 from __future__ import annotations
@@ -24,6 +28,14 @@ import torch.nn.functional as F
 
 from a1_basics.model import BasicsTransformerLM
 from a1_basics.data import get_batch
+
+# NVTX for Nsight Systems; only used when --nvtx and device is CUDA
+_nvtx = None
+if torch.cuda.is_available():
+    try:
+        _nvtx = torch.cuda.nvtx  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
 
 # §1.1.2 Table 1: vocab_size=10_000, batch_size=4 for all; context_length varies.
 MODEL_SIZES: dict[str, dict[str, Any]] = {
@@ -95,7 +107,48 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run same config with warmup 0, 1, 2, 5; output comparison table",
     )
+    # §1.1.4 Nsight Systems: NVTX ranges for filtering warmup / forward / backward in nsys
+    p.add_argument(
+        "--nvtx",
+        action="store_true",
+        help="Wrap warmup and forward/backward/optimizer in NVTX ranges for nsys profile",
+    )
+    p.add_argument(
+        "--nvtx_attention",
+        action="store_true",
+        help="Patch attention with NVTX sub-ranges (attention scores, softmax, final matmul)",
+    )
     return p.parse_args()
+
+
+def _nvtx_range(name: str, use: bool):
+    """Context manager for NVTX range when use and _nvtx available; else no-op."""
+    if not use or _nvtx is None:
+        from contextlib import nullcontext
+        return nullcontext()
+    return _nvtx.range(name)
+
+
+def _install_nvtx_attention() -> None:
+    """Replace a1_basics.model.scaled_dot_product_attention with NVTX-annotated version."""
+    from einops import einsum
+    from a1_basics.model import scaled_dot_product_attention as _orig_sdpa
+    from a1_basics.nn_utils import softmax
+    import a1_basics.model as a1_model
+
+    def annotated_scaled_dot_product_attention(Q, K, V, mask=None):
+        with _nvtx.range("scaled dot product attention"):
+            with _nvtx.range("computing attention scores"):
+                d_k = K.shape[-1]
+                attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
+                if mask is not None:
+                    attention_scores = torch.where(mask, attention_scores, float("-inf"))
+            with _nvtx.range("computing softmax"):
+                attention_weights = softmax(attention_scores, dim=-1)
+            with _nvtx.range("final matmul"):
+                return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+
+    a1_model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
 
 def run_benchmark(
@@ -112,8 +165,13 @@ def run_benchmark(
     warmup: int = 5,
     steps: int = 10,
     rope_theta: float = 10000.0,
+    use_nvtx: bool = False,
+    use_nvtx_attention: bool = False,
 ) -> tuple[float, float]:
     """Run benchmark; return (mean_ms, std_ms) over steps. Uses timeit.default_timer and cuda sync."""
+    if use_nvtx_attention and _nvtx is not None:
+        _install_nvtx_attention()
+
     model = BasicsTransformerLM(
         vocab_size=vocab_size,
         context_length=context_length,
@@ -140,17 +198,18 @@ def run_benchmark(
     else:
         model.eval()
 
-    for _ in range(warmup):
-        logits = model(x)
-        if do_backward:
-            loss = F.cross_entropy(
-                logits.view(-1, vocab_size), y.view(-1), ignore_index=-100
-            )
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-        if device.startswith("cuda"):
-            torch.cuda.synchronize()
+    with _nvtx_range("warmup", use_nvtx):
+        for _ in range(warmup):
+            logits = model(x)
+            if do_backward:
+                loss = F.cross_entropy(
+                    logits.view(-1, vocab_size), y.view(-1), ignore_index=-100
+                )
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+            if device.startswith("cuda"):
+                torch.cuda.synchronize()
 
     timer = timeit.default_timer
     step_times_s: list[float] = []
@@ -158,14 +217,18 @@ def run_benchmark(
         if device.startswith("cuda"):
             torch.cuda.synchronize()
         start = timer()
-        logits = model(x)
+        with _nvtx_range("forward", use_nvtx):
+            logits = model(x)
         if do_backward:
-            loss = F.cross_entropy(
-                logits.view(-1, vocab_size), y.view(-1), ignore_index=-100
-            )
+            with _nvtx_range("loss", use_nvtx):
+                loss = F.cross_entropy(
+                    logits.view(-1, vocab_size), y.view(-1), ignore_index=-100
+                )
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+            with _nvtx_range("backward", use_nvtx):
+                loss.backward()
+            with _nvtx_range("optimizer_step", use_nvtx):
+                optimizer.step()
         if device.startswith("cuda"):
             torch.cuda.synchronize()
         step_times_s.append(timer() - start)
@@ -209,6 +272,8 @@ def main() -> None:
         warmup=args.warmup,
         steps=args.steps,
         rope_theta=args.rope_theta,
+        use_nvtx=args.nvtx,
+        use_nvtx_attention=args.nvtx_attention,
     )
     print(f"mode={args.mode} warmup={args.warmup} steps={args.steps} device={device}")
     print(f"per_step_ms: mean={mean_ms:.2f} std={std_ms:.2f} (mean±std: {mean_ms:.2f}±{std_ms:.2f})")
