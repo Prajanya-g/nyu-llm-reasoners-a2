@@ -10,9 +10,10 @@ warmup=0, 1, 2, 5. Example:
   uv run python -m student.benchmark --compare_warmup --size small
   uv run python -m student.benchmark --compare_warmup --output warmup.csv --latex
 
-Nsight Systems (§1.1.4): run under nsys with NVTX ranges to filter warmup/forward/backward:
-  uv run nsys profile -o result.nsys-rep --stats=true python -m student.benchmark --size small --nvtx
-  uv run nsys profile -o result.nsys-rep python -m student.benchmark --size small --nvtx --nvtx_attention
+Nsight Systems (§1.1.4): NVTX is only captured if nsys is run with --trace=nvtx. Use:
+  uv run nsys profile --trace=cuda,nvtx -o result.nsys-rep python -m student.benchmark --size small --nvtx
+  uv run nsys profile --trace=cuda,nvtx -o result.nsys-rep python -m student.benchmark --size small --nvtx --nvtx_attention
+Run on GPU (--device cuda); otherwise the report will not contain NVTX data.
 """
 
 from __future__ import annotations
@@ -240,6 +241,13 @@ def run_benchmark(
 def main() -> None:
     args = parse_args()
     device = args.device
+
+    if args.nvtx:
+        if not device.startswith("cuda"):
+            print("Warning: --nvtx is set but device is not cuda. NVTX ranges require CUDA; report may have no NVTX data.")
+        if _nvtx is None:
+            print("Warning: torch.cuda.nvtx not available. NVTX ranges will not be pushed.")
+        print("Hint: run nsys with --trace=cuda,nvtx so NVTX is captured, e.g. nsys profile --trace=cuda,nvtx -o out ...")
 
     if args.all_sizes:
         _run_all_sizes(args)
