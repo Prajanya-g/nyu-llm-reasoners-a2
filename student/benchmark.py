@@ -15,6 +15,9 @@ Nsight Systems (§1.1.4): NVTX is only captured if nsys is run with --trace=nvtx
   uv run nsys profile --trace=cuda,nvtx -o result.nsys-rep python -m student.benchmark --size small --nvtx --nvtx_attention
 Run on GPU (--device cuda). If NVTX still does not appear (e.g. in Singularity), use
 Stats -> CUDA GPU Kernel Summary in Nsight Systems for the report questions.
+
+Mixed precision (§1.1.5): --bf16 runs with torch.autocast(bf16); --compare_bf16 runs each
+Table 1 size with full and BF16 and prints a comparison table.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from __future__ import annotations
 import argparse
 import math
 import timeit
+from contextlib import nullcontext
 from typing import Any
 
 import numpy as np
@@ -121,6 +125,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Patch attention with NVTX sub-ranges (attention scores, softmax, final matmul)",
     )
+    # §1.1.5 Mixed precision: optional BF16 autocast
+    p.add_argument(
+        "--bf16",
+        action="store_true",
+        help="Run with mixed precision (BF16) via torch.autocast",
+    )
+    p.add_argument(
+        "--compare_bf16",
+        action="store_true",
+        help="Run each Table 1 size with full and BF16; output comparison table",
+    )
     return p.parse_args()
 
 
@@ -128,7 +143,13 @@ def _nvtx_range(name: str, use: bool):
     """Context manager: with nvtx.range(name) when use and nvtx available (assignment pattern)."""
     if use and nvtx is not None:
         return nvtx.range(name)
-    from contextlib import nullcontext
+    return nullcontext()
+
+
+def _autocast_ctx(use_bf16: bool, device: str):
+    """torch.autocast(device_type='cuda', dtype=torch.bfloat16) or no-op (nullcontext)."""
+    if use_bf16 and device.startswith("cuda"):
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     return nullcontext()
 
 
@@ -171,10 +192,13 @@ def run_benchmark(
     rope_theta: float = 10000.0,
     use_nvtx: bool = False,
     use_nvtx_attention: bool = False,
+    use_bf16: bool = False,
 ) -> tuple[float, float]:
     """Run benchmark; return (mean_ms, std_ms) over steps. Uses timeit.default_timer and cuda sync."""
     if use_nvtx_attention and nvtx is not None:
         _install_nvtx_attention()
+
+    autocast_ctx = _autocast_ctx(use_bf16, device)
 
     model = BasicsTransformerLM(
         vocab_size=vocab_size,
@@ -204,14 +228,15 @@ def run_benchmark(
 
     with _nvtx_range("warmup", use_nvtx):
         for _ in range(warmup):
-            logits = model(x)
-            if do_backward:
-                loss = F.cross_entropy(
-                    logits.view(-1, vocab_size), y.view(-1), ignore_index=-100
-                )
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+            with autocast_ctx:
+                logits = model(x)
+                if do_backward:
+                    loss = F.cross_entropy(
+                        logits.view(-1, vocab_size), y.view(-1), ignore_index=-100
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    optimizer.step()
             if device.startswith("cuda"):
                 torch.cuda.synchronize()
 
@@ -221,18 +246,19 @@ def run_benchmark(
         if device.startswith("cuda"):
             torch.cuda.synchronize()
         start = timer()
-        with _nvtx_range("forward", use_nvtx):
-            logits = model(x)
-        if do_backward:
-            with _nvtx_range("loss", use_nvtx):
-                loss = F.cross_entropy(
-                    logits.view(-1, vocab_size), y.view(-1), ignore_index=-100
-                )
-            optimizer.zero_grad(set_to_none=True)
-            with _nvtx_range("backward", use_nvtx):
-                loss.backward()
-            with _nvtx_range("optimizer_step", use_nvtx):
-                optimizer.step()
+        with autocast_ctx:
+            with _nvtx_range("forward", use_nvtx):
+                logits = model(x)
+            if do_backward:
+                with _nvtx_range("loss", use_nvtx):
+                    loss = F.cross_entropy(
+                        logits.view(-1, vocab_size), y.view(-1), ignore_index=-100
+                    )
+                optimizer.zero_grad(set_to_none=True)
+                with _nvtx_range("backward", use_nvtx):
+                    loss.backward()
+                with _nvtx_range("optimizer_step", use_nvtx):
+                    optimizer.step()
         if device.startswith("cuda"):
             torch.cuda.synchronize()
         step_times_s.append(timer() - start)
@@ -262,6 +288,10 @@ def main() -> None:
         _run_compare_warmup(args)
         return
 
+    if args.compare_bf16:
+        _run_compare_bf16(args)
+        return
+
     # Apply §1.1.2 preset if --size set
     if args.size is not None:
         preset = MODEL_SIZES[args.size]
@@ -287,8 +317,10 @@ def main() -> None:
         rope_theta=args.rope_theta,
         use_nvtx=args.nvtx,
         use_nvtx_attention=args.nvtx_attention,
+        use_bf16=args.bf16,
     )
-    print(f"mode={args.mode} warmup={args.warmup} steps={args.steps} device={device}")
+    prec = "bf16" if args.bf16 else "fp32"
+    print(f"mode={args.mode} warmup={args.warmup} steps={args.steps} device={device} precision={prec}")
     print(f"per_step_ms: mean={mean_ms:.2f} std={std_ms:.2f} (mean±std: {mean_ms:.2f}±{std_ms:.2f})")
 
 
@@ -362,6 +394,96 @@ def _run_compare_warmup(args: argparse.Namespace) -> None:
             latex_kwargs={
                 "caption": "Effect of warm-up steps on timings (mean±std ms)",
                 "label": "tab:warmup",
+            },
+        )
+        print(f"\nWrote {args.output}" + (" (+ .tex, .md)" if (args.latex or args.markdown) else ""))
+
+
+def _run_compare_bf16(args: argparse.Namespace) -> None:
+    """Run each Table 1 size with full (FP32) and BF16 mixed precision; output comparison table (§1.1.5)."""
+    try:
+        from student.table_utils import (
+            format_latex,
+            format_markdown,
+            table_from_records,
+            write_table,
+        )
+    except ImportError:
+        from table_utils import (
+            format_latex,
+            format_markdown,
+            table_from_records,
+            write_table,
+        )
+
+    device = args.device
+    warmup = args.warmup
+    steps = args.steps
+    context_length = args.context_length
+
+    size_order = list(MODEL_SIZES)
+    if args.sizes:
+        sizes_to_run = [s for s in size_order if s in args.sizes]
+    else:
+        sizes_to_run = size_order
+
+    rows: list[dict[str, Any]] = []
+    for size_name in sizes_to_run:
+        preset = MODEL_SIZES[size_name]
+        cfg = {
+            "vocab_size": VOCAB_SIZE_REF,
+            "batch_size": BATCH_SIZE_REF,
+            "context_length": context_length,
+            "d_model": preset["d_model"],
+            "d_ff": preset["d_ff"],
+            "num_layers": preset["num_layers"],
+            "num_heads": preset["num_heads"],
+            "warmup": warmup,
+            "steps": steps,
+            "device": device,
+        }
+        fwd_fp, _ = run_benchmark(mode="forward", use_bf16=False, **cfg)
+        full_fp, _ = run_benchmark(mode="forward_backward", use_bf16=False, **cfg)
+        fwd_bf16, _ = run_benchmark(mode="forward", use_bf16=True, **cfg)
+        full_bf16, _ = run_benchmark(mode="forward_backward", use_bf16=True, **cfg)
+        bwd_fp = full_fp - fwd_fp
+        bwd_bf16 = full_bf16 - fwd_bf16
+        speedup_fwd = fwd_fp / fwd_bf16 if fwd_bf16 > 0 else 0.0
+        speedup_full = full_fp / full_bf16 if full_bf16 > 0 else 0.0
+
+        rows.append({
+            "size": size_name,
+            "forward_fp32_ms": round(fwd_fp, 2),
+            "forward_bf16_ms": round(fwd_bf16, 2),
+            "full_step_fp32_ms": round(full_fp, 2),
+            "full_step_bf16_ms": round(full_bf16, 2),
+            "backward_fp32_ms": round(bwd_fp, 2),
+            "backward_bf16_ms": round(bwd_bf16, 2),
+            "speedup_forward": round(speedup_fwd, 2),
+            "speedup_full_step": round(speedup_full, 2),
+        })
+
+    df = table_from_records(rows)
+    print(
+        f"§1.1.5 Full vs BF16 mixed precision: warmup={warmup} steps={steps} "
+        f"vocab_size={VOCAB_SIZE_REF} batch_size={BATCH_SIZE_REF} "
+        f"context_length={context_length} device={device}\n"
+    )
+    print(df.to_string(index=False))
+
+    if args.latex:
+        print("\n--- LaTeX ---\n" + format_latex(df))
+    if args.markdown:
+        print("\n--- Markdown ---\n" + format_markdown(df))
+    if args.output:
+        write_table(
+            df,
+            path=args.output,
+            latex=args.latex,
+            markdown=args.markdown,
+            latex_kwargs={
+                "caption": "Full vs BF16 mixed precision timings (ms) and speedup",
+                "label": "tab:bf16",
             },
         )
         print(f"\nWrote {args.output}" + (" (+ .tex, .md)" if (args.latex or args.markdown) else ""))
