@@ -84,13 +84,14 @@ def run_memory_profile(
             with torch.no_grad():
                 logits = model(x)
         else:
+            # Train mode: forward + backward only (skip optimizer.step() — OOMs on 2.7B)
             logits = model(x)
             loss = F.cross_entropy(
                 logits.view(-1, VOCAB_SIZE), y.view(-1), ignore_index=-100
             )
             optimizer.zero_grad()
             loss.backward()
-            optimizer.step()
+            # skip optimizer.step() — 2.7B needs ~4× weight size for full step (Adam buffers)
 
     torch.cuda.memory._dump_snapshot(output)
     torch.cuda.memory._record_memory_history(enabled=None)
