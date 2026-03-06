@@ -13,7 +13,8 @@ warmup=0, 1, 2, 5. Example:
 Nsight Systems (§1.1.4): NVTX is only captured if nsys is run with --trace=nvtx. Use:
   uv run nsys profile --trace=cuda,nvtx -o result.nsys-rep python -m student.benchmark --size small --nvtx
   uv run nsys profile --trace=cuda,nvtx -o result.nsys-rep python -m student.benchmark --size small --nvtx --nvtx_attention
-Run on GPU (--device cuda); otherwise the report will not contain NVTX data.
+Run on GPU (--device cuda). If NVTX still does not appear (e.g. in Singularity), use
+Stats -> CUDA GPU Kernel Summary in Nsight Systems for the report questions.
 """
 
 from __future__ import annotations
@@ -21,7 +22,6 @@ from __future__ import annotations
 import argparse
 import math
 import timeit
-from contextlib import contextmanager
 from typing import Any
 
 import numpy as np
@@ -31,13 +31,14 @@ import torch.nn.functional as F
 from a1_basics.model import BasicsTransformerLM
 from a1_basics.data import get_batch
 
-# NVTX for Nsight Systems; only used when --nvtx and device is CUDA
-_nvtx = None
+# NVTX for Nsight Systems (§1.1.4): assignment pattern — import torch.cuda.nvtx as nvtx
+nvtx = None
 if torch.cuda.is_available():
     try:
-        _nvtx = torch.cuda.nvtx  # type: ignore[attr-defined]
+        nvtx = torch.cuda.nvtx  # type: ignore[attr-defined]
     except AttributeError:
         pass
+
 
 # §1.1.2 Table 1: vocab_size=10_000, batch_size=4 for all; context_length varies.
 MODEL_SIZES: dict[str, dict[str, Any]] = {
@@ -123,44 +124,33 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-@contextmanager
 def _nvtx_range(name: str, use: bool):
-    """Context manager for NVTX range using explicit range_push/range_pop (works in containers)."""
-    if use and _nvtx is not None:
-        _nvtx.range_push(name)
-    try:
-        yield
-    finally:
-        if use and _nvtx is not None:
-            _nvtx.range_pop()
+    """Context manager: with nvtx.range(name) when use and nvtx available (assignment pattern)."""
+    if use and nvtx is not None:
+        return nvtx.range(name)
+    from contextlib import nullcontext
+    return nullcontext()
 
 
 def _install_nvtx_attention() -> None:
-    """Replace a1_basics.model.scaled_dot_product_attention with NVTX-annotated version (range_push/range_pop)."""
+    """Replace a1_basics.model.scaled_dot_product_attention with NVTX-annotated version (assignment pattern)."""
     from einops import einsum
     from a1_basics.nn_utils import softmax
     import a1_basics.model as a1_model
 
+    @nvtx.range("scaled dot product attention")
     def annotated_scaled_dot_product_attention(Q, K, V, mask=None):
-        _nvtx.range_push("scaled dot product attention")
+        with nvtx.range("computing attention scores"):
+            d_k = K.shape[-1]
+            attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
+            if mask is not None:
+                attention_scores = torch.where(mask, attention_scores, float("-inf"))
 
-        _nvtx.range_push("computing attention scores")
-        d_k = K.shape[-1]
-        attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
-        if mask is not None:
-            attention_scores = torch.where(mask, attention_scores, float("-inf"))
-        _nvtx.range_pop()
+        with nvtx.range("computing softmax"):
+            attention_weights = softmax(attention_scores, dim=-1)
 
-        _nvtx.range_push("computing softmax")
-        attention_weights = softmax(attention_scores, dim=-1)
-        _nvtx.range_pop()
-
-        _nvtx.range_push("final matmul")
-        out = einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
-        _nvtx.range_pop()
-
-        _nvtx.range_pop()  # scaled dot product attention
-        return out
+        with nvtx.range("final matmul"):
+            return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
 
     a1_model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
@@ -183,7 +173,7 @@ def run_benchmark(
     use_nvtx_attention: bool = False,
 ) -> tuple[float, float]:
     """Run benchmark; return (mean_ms, std_ms) over steps. Uses timeit.default_timer and cuda sync."""
-    if use_nvtx_attention and _nvtx is not None:
+    if use_nvtx_attention and nvtx is not None:
         _install_nvtx_attention()
 
     model = BasicsTransformerLM(
@@ -257,10 +247,12 @@ def main() -> None:
 
     if args.nvtx:
         if not device.startswith("cuda"):
-            print("Warning: --nvtx is set but device is not cuda. NVTX ranges require CUDA; report may have no NVTX data.")
-        if _nvtx is None:
-            print("Warning: torch.cuda.nvtx not available. NVTX ranges will not be pushed.")
-        print("Hint: run nsys with --trace=cuda,nvtx so NVTX is captured, e.g. nsys profile --trace=cuda,nvtx -o out ...")
+            print("Warning: --nvtx is set but device is not cuda. NVTX requires CUDA; report may have no NVTX data.")
+        if nvtx is not None:
+            print("NVTX: using torch.cuda.nvtx. Run nsys with: nsys profile --trace=cuda,nvtx -o out.nsys-rep ...")
+        else:
+            print("Warning: torch.cuda.nvtx not available. NVTX ranges will be no-ops.")
+            print("If NVTX does not show in nsys (e.g. in Singularity), use CUDA GPU Kernel Summary for the report.")
 
     if args.all_sizes:
         _run_all_sizes(args)
