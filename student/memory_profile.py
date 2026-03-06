@@ -35,6 +35,7 @@ def run_memory_profile(
     bf16: bool = False,
     output: str = "memory_snapshot.pickle",
     size: str = "2.7B",
+    batch_size: int = 4,
 ) -> None:
     device = "cuda"
     cfg = MODEL_SIZES[size]
@@ -47,11 +48,11 @@ def run_memory_profile(
     ).to(device)
 
     rng = np.random.default_rng(42)
-    dataset_size = max(context_length + 1, BATCH_SIZE * (context_length + 1))
+    dataset_size = max(context_length + 1, batch_size * (context_length + 1))
     dataset = rng.integers(0, VOCAB_SIZE, size=dataset_size).astype(np.int64)
     x, y = get_batch(
         dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=batch_size,
         context_length=context_length,
         device=device,
     )
@@ -107,6 +108,7 @@ if __name__ == "__main__":
     )
     p.add_argument("--context_length", type=int, default=128)
     p.add_argument("--mode", choices=["forward", "train"], default="forward")
+    p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--output", type=str, default="memory_snapshot.pickle")
     p.add_argument(
@@ -123,4 +125,5 @@ if __name__ == "__main__":
         args.bf16,
         args.output,
         args.size,
+        args.batch_size,
     )
