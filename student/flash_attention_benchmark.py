@@ -162,6 +162,7 @@ def run_one_config(
 
 
 def main() -> None:
+    global WARMUP_MS, REP_MS
     parser = argparse.ArgumentParser(description="FlashAttention-2 vs PyTorch benchmark")
     parser.add_argument(
         "--seq-len",
@@ -211,7 +212,6 @@ def main() -> None:
         raise RuntimeError("triton.testing.do_bench is required; install triton.")
 
     device = torch.device("cuda")
-    global WARMUP_MS, REP_MS
     WARMUP_MS = args.warmup
     REP_MS = args.rep
 
