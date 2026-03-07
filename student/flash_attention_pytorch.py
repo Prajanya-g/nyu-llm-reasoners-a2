@@ -11,6 +11,8 @@ from typing import Optional
 import torch
 from torch.autograd import Function
 
+from student.flash_attention_backward import flash_attention_backward
+
 # Tile sizes >= 16; dimensions are powers of 2 and >= 16 in tests.
 BR = 16  # query block size
 BC = 16  # key block size
@@ -94,4 +96,8 @@ class FlashAttentionPyTorch(Function):
         ctx: torch.autograd.function.FunctionCtx,
         grad_output: torch.Tensor,
     ) -> tuple[Optional[torch.Tensor], ...]:
-        raise NotImplementedError
+        Q, K, V, O, L = ctx.saved_tensors
+        dQ, dK, dV = flash_attention_backward(
+            Q, K, V, O, grad_output, L, is_causal=ctx.is_causal
+        )
+        return dQ, dK, dV, None

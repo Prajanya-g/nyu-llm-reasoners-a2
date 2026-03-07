@@ -15,6 +15,8 @@ from torch.autograd import Function
 from triton import cdiv
 from triton import language as tl
 
+from student.flash_attention_backward import flash_attention_backward
+
 
 @triton.jit
 def flash_fwd_kernel(
@@ -43,7 +45,7 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
+    is_causal: tl.constexpr,
 ):
     # Program indices: one program per (query_tile, batch)
     query_tile_index = tl.program_id(0)
@@ -107,12 +109,13 @@ def flash_fwd_kernel(
         # S_ij = Q_i @ K_j^T * scale  (Q_TILE_SIZE x K_TILE_SIZE)
         S_ij = tl.dot(Q_i, tl.trans(K_j)) * scale
 
-        # Causal mask: query q can only attend to keys k where k <= q
-        if IS_CAUSAL:
-            q_global = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
-            k_global = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
-            causal_mask = q_global[:, None] >= k_global[None, :]
-            S_ij = tl.where(causal_mask, S_ij, float("-inf"))
+        # Causal mask (Bq x Bk): index comparison; add -1e6 to masked elements of S_ij
+        if is_causal:
+            q_idx = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+            k_idx = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+            # Allowed where q_idx >= k_idx (query can attend to key)
+            mask = q_idx[:, None] >= k_idx[None, :]
+            S_ij = S_ij + tl.where(mask, 0.0, -1e6)
 
         # Online softmax: row max and new m
         m_ij = tl.max(S_ij, axis=1)
@@ -200,7 +203,7 @@ class FlashAttentionTriton(Function):
             D=D,
             Q_TILE_SIZE=Q_TILE_SIZE_CONST,
             K_TILE_SIZE=K_TILE_SIZE_CONST,
-            IS_CAUSAL=is_causal,
+            is_causal=is_causal,
         )
 
         ctx.save_for_backward(Q, K, V, O, L)
@@ -212,4 +215,8 @@ class FlashAttentionTriton(Function):
         ctx: torch.autograd.function.FunctionCtx,
         grad_output: torch.Tensor,
     ) -> tuple[Optional[torch.Tensor], ...]:
-        raise NotImplementedError
+        Q, K, V, O, L = ctx.saved_tensors
+        dQ, dK, dV = flash_attention_backward(
+            Q, K, V, O, grad_output, L, is_causal=ctx.is_causal
+        )
+        return dQ, dK, dV, None
