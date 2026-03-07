@@ -136,6 +136,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run each Table 1 size with full and BF16; output comparison table",
     )
+    # §1.1.3 torch.compile: vanilla vs compiled Transformer
+    p.add_argument(
+        "--compile",
+        action="store_true",
+        help="Run model with torch.compile(model)",
+    )
+    p.add_argument(
+        "--compare_compile",
+        action="store_true",
+        help="Run each Table 1 size vanilla vs compiled; output comparison table",
+    )
     return p.parse_args()
 
 
@@ -193,6 +204,7 @@ def run_benchmark(
     use_nvtx: bool = False,
     use_nvtx_attention: bool = False,
     use_bf16: bool = False,
+    use_compile: bool = False,
 ) -> tuple[float, float]:
     """Run benchmark; return (mean_ms, std_ms) over steps. Uses timeit.default_timer and cuda sync."""
     if use_nvtx_attention and nvtx is not None:
@@ -209,6 +221,8 @@ def run_benchmark(
         d_ff=d_ff,
         rope_theta=rope_theta,
     ).to(device)
+    if use_compile:
+        model = torch.compile(model)
 
     rng = np.random.default_rng(42)
     dataset_size = max(
@@ -292,6 +306,10 @@ def main() -> None:
         _run_compare_bf16(args)
         return
 
+    if args.compare_compile:
+        _run_compare_compile(args)
+        return
+
     # Apply §1.1.2 preset if --size set
     if args.size is not None:
         preset = MODEL_SIZES[args.size]
@@ -318,9 +336,14 @@ def main() -> None:
         use_nvtx=args.nvtx,
         use_nvtx_attention=args.nvtx_attention,
         use_bf16=args.bf16,
+        use_compile=args.compile,
     )
     prec = "bf16" if args.bf16 else "fp32"
-    print(f"mode={args.mode} warmup={args.warmup} steps={args.steps} device={device} precision={prec}")
+    comp = "compiled" if args.compile else "vanilla"
+    print(
+        f"mode={args.mode} warmup={args.warmup} steps={args.steps} "
+        f"device={device} precision={prec} model={comp}"
+    )
     print(f"per_step_ms: mean={mean_ms:.2f} std={std_ms:.2f} (mean±std: {mean_ms:.2f}±{std_ms:.2f})")
 
 
@@ -487,6 +510,101 @@ def _run_compare_bf16(args: argparse.Namespace) -> None:
             },
         )
         print(f"\nWrote {args.output}" + (" (+ .tex, .md)" if (args.latex or args.markdown) else ""))
+
+
+def _run_compare_compile(args: argparse.Namespace) -> None:
+    """Run each Table 1 size vanilla vs torch.compile(model); output comparison table (§1.1.3b)."""
+    try:
+        from student.table_utils import (
+            format_latex,
+            format_markdown,
+            table_from_records,
+            write_table,
+        )
+    except ImportError:
+        from table_utils import (
+            format_latex,
+            format_markdown,
+            table_from_records,
+            write_table,
+        )
+
+    device = args.device
+    warmup = args.warmup
+    steps = args.steps
+    context_length = args.context_length
+
+    size_order = list(MODEL_SIZES)
+    if args.sizes:
+        sizes_to_run = [s for s in size_order if s in args.sizes]
+    else:
+        sizes_to_run = size_order
+
+    rows: list[dict[str, Any]] = []
+    for size_name in sizes_to_run:
+        preset = MODEL_SIZES[size_name]
+        cfg = {
+            "vocab_size": VOCAB_SIZE_REF,
+            "batch_size": BATCH_SIZE_REF,
+            "context_length": context_length,
+            "d_model": preset["d_model"],
+            "d_ff": preset["d_ff"],
+            "num_layers": preset["num_layers"],
+            "num_heads": preset["num_heads"],
+            "warmup": warmup,
+            "steps": steps,
+            "device": device,
+        }
+        fwd_vanilla, _ = run_benchmark(
+            mode="forward", use_compile=False, **cfg
+        )
+        full_vanilla, _ = run_benchmark(
+            mode="forward_backward", use_compile=False, **cfg
+        )
+        fwd_compiled, _ = run_benchmark(
+            mode="forward", use_compile=True, **cfg
+        )
+        full_compiled, _ = run_benchmark(
+            mode="forward_backward", use_compile=True, **cfg
+        )
+        bwd_vanilla = full_vanilla - fwd_vanilla
+        bwd_compiled = full_compiled - fwd_compiled
+
+        rows.append({
+            "size": size_name,
+            "forward_vanilla_ms": round(fwd_vanilla, 2),
+            "forward_compiled_ms": round(fwd_compiled, 2),
+            "full_step_vanilla_ms": round(full_vanilla, 2),
+            "full_step_compiled_ms": round(full_compiled, 2),
+            "backward_vanilla_ms": round(bwd_vanilla, 2),
+            "backward_compiled_ms": round(bwd_compiled, 2),
+        })
+
+    df = table_from_records(rows)
+    print(
+        f"§1.1.3(b) Vanilla vs torch.compile: warmup={warmup} steps={steps} "
+        f"vocab_size={VOCAB_SIZE_REF} batch_size={BATCH_SIZE_REF} "
+        f"context_length={context_length} device={device}\n"
+    )
+    print(df.to_string(index=False))
+
+    if args.latex:
+        print("\n--- LaTeX ---\n" + format_latex(df))
+    if args.markdown:
+        print("\n--- Markdown ---\n" + format_markdown(df))
+    if args.output:
+        write_table(
+            df,
+            path=args.output,
+            latex=args.latex,
+            markdown=args.markdown,
+            latex_kwargs={
+                "caption": "Vanilla vs torch.compile Transformer timings (ms)",
+                "label": "tab:compile",
+            },
+        )
+        suffix = " (+ .tex, .md)" if (args.latex or args.markdown) else ""
+        print(f"\nWrote {args.output}{suffix}")
 
 
 def _run_all_sizes(args: argparse.Namespace) -> None:

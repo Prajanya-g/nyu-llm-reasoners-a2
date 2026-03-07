@@ -3,7 +3,8 @@
 
 Iterates d_model in [16, 32, 64, 128] and seq_len in [256, 1024, 4096, 8192, 16384].
 Times 100 forward and 100 backward passes; warmup and torch.cuda.synchronize().
-Reports memory before backward and catches OOM.
+Reports memory before backward and catches OOM. With --compile, also runs
+torch.compile(attention) and reports comparison table (uncompiled vs compiled).
 """
 
 from __future__ import annotations
@@ -36,17 +37,18 @@ def make_causal_mask(
     return mask
 
 
-def run_one_config(
+def _run_one_config_with_attn(
     d_model: int,
     seq_len: int,
+    attn_fn: Any,
+    label: str,
 ) -> dict[str, Any]:
-    """Run forward and backward timing for one (d_model, seq_len). Return row dict or OOM."""
+    """Run forward and backward timing using attn_fn(Q, K, V, mask=mask)."""
     try:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
 
-        # Single-head: Q, K, V shape (batch, seq_len, d_model)
         Q = torch.randn(
             BATCH_SIZE, seq_len, d_model,
             device=DEVICE, dtype=torch.float32, requires_grad=True,
@@ -61,29 +63,24 @@ def run_one_config(
         )
         mask = make_causal_mask(BATCH_SIZE, seq_len, Q.device)
 
-        # Warmup forward
         for _ in range(NUM_WARMUP):
-            out = scaled_dot_product_attention(Q, K, V, mask=mask)
+            out = attn_fn(Q, K, V, mask=mask)
             torch.cuda.synchronize()
 
-        # Time 100 forward passes
         timer = timeit.default_timer
         fwd_times = []
         for _ in range(NUM_FORWARD):
             torch.cuda.synchronize()
             t0 = timer()
-            out = scaled_dot_product_attention(Q, K, V, mask=mask)
+            out = attn_fn(Q, K, V, mask=mask)
             torch.cuda.synchronize()
             fwd_times.append(timer() - t0)
 
         mean_fwd_ms = (sum(fwd_times) / len(fwd_times)) * 1000
-        memory_before_backward_mb = (
-            torch.cuda.max_memory_allocated() / (1024**2)
-        )
+        memory_mb = torch.cuda.max_memory_allocated() / (1024**2)
 
-        # Warmup backward (forward + backward)
         for _ in range(NUM_WARMUP):
-            out = scaled_dot_product_attention(Q, K, V, mask=mask)
+            out = attn_fn(Q, K, V, mask=mask)
             loss = out.sum()
             loss.backward()
             Q.grad = None
@@ -91,12 +88,11 @@ def run_one_config(
             V.grad = None
             torch.cuda.synchronize()
 
-        # Time 100 backward passes (each: forward + backward, we need graph)
         bwd_times = []
         for _ in range(NUM_BACKWARD):
             torch.cuda.synchronize()
             t0 = timer()
-            out = scaled_dot_product_attention(Q, K, V, mask=mask)
+            out = attn_fn(Q, K, V, mask=mask)
             loss = out.sum()
             loss.backward()
             Q.grad = None
@@ -106,29 +102,52 @@ def run_one_config(
             bwd_times.append(timer() - t0)
 
         mean_bwd_ms = (sum(bwd_times) / len(bwd_times)) * 1000
-
         return {
-            "d_model": d_model,
-            "seq_len": seq_len,
-            "forward_ms": round(mean_fwd_ms, 2),
-            "backward_ms": round(mean_bwd_ms, 2),
-            "memory_before_backward_mb": round(memory_before_backward_mb, 1),
-            "status": "ok",
+            f"forward_{label}_ms": round(mean_fwd_ms, 2),
+            f"backward_{label}_ms": round(mean_bwd_ms, 2),
+            "memory_before_backward_mb": round(memory_mb, 1),
+            f"status_{label}": "ok",
         }
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
         return {
-            "d_model": d_model,
-            "seq_len": seq_len,
-            "forward_ms": None,
-            "backward_ms": None,
+            f"forward_{label}_ms": None,
+            f"backward_{label}_ms": None,
             "memory_before_backward_mb": None,
-            "status": "OOM",
+            f"status_{label}": "OOM",
         }
+
+
+def run_one_config(
+    d_model: int,
+    seq_len: int,
+    include_compiled: bool = False,
+) -> dict[str, Any]:
+    """Run timing for (d_model, seq_len); optionally include torch.compile comparison."""
+    row: dict[str, Any] = {"d_model": d_model, "seq_len": seq_len}
+
+    uncompiled = _run_one_config_with_attn(
+        d_model, seq_len, scaled_dot_product_attention, "uncompiled",
+    )
+    row.update(uncompiled)
+
+    if include_compiled:
+        compiled_sdpa = torch.compile(scaled_dot_product_attention)
+        compiled = _run_one_config_with_attn(
+            d_model, seq_len, compiled_sdpa, "compiled",
+        )
+        row.update(compiled)
+
+    return row
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Benchmark attention (batch=8, single-head).")
+    p.add_argument(
+        "--compile",
+        action="store_true",
+        help="Also run torch.compile(attention) and add compiled columns to table",
+    )
     p.add_argument("--output", type=str, default=None, help="Write table CSV path")
     p.add_argument("--latex", action="store_true")
     p.add_argument("--markdown", action="store_true")
@@ -145,7 +164,9 @@ def main() -> None:
             f"[{i+1}/{len(configs)}] d_model={d_model} seq_len={seq_len} ...",
             flush=True,
         )
-        row = run_one_config(d_model, seq_len)
+        row = run_one_config(
+            d_model, seq_len, include_compiled=args.compile,
+        )
         rows.append(row)
 
     try:
@@ -164,9 +185,10 @@ def main() -> None:
         )
 
     df = table_from_records(rows)
-    print(
-        "\nAttention benchmark (batch=8, single-head, 100 fwd / 100 bwd):\n"
-    )
+    title = "Attention (batch=8, single-head, 100 fwd / 100 bwd)"
+    if args.compile:
+        title += " — uncompiled vs torch.compile"
+    print(f"\n{title}:\n")
     print(df.to_string(index=False))
 
     if args.latex:
