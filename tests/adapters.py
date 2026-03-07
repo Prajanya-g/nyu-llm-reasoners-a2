@@ -4,6 +4,10 @@ from typing import Type
 
 import torch
 
+try:
+    from student.flash_attention_pytorch import FlashAttentionPyTorch
+except ImportError:
+    FlashAttentionPyTorch = None  # type: ignore[misc, assignment]
 
 
 def get_flashattention_autograd_function_pytorch() -> Type:
@@ -15,8 +19,11 @@ def get_flashattention_autograd_function_pytorch() -> Type:
     Returns:
         A class object (not an instance of the class)
     """
-    # For example: return MyFlashAttnAutogradFunctionClass
-    raise NotImplementedError
+    if FlashAttentionPyTorch is None:
+        raise NotImplementedError(
+            "student.flash_attention_pytorch.FlashAttentionPyTorch not found"
+        )
+    return FlashAttentionPyTorch
 
 
 def get_flashattention_autograd_function_triton() -> Type:
