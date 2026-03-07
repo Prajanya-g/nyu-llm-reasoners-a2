@@ -9,6 +9,11 @@ try:
 except ImportError:
     FlashAttentionPyTorch = None  # type: ignore[misc, assignment]
 
+try:
+    from student.flash_attention_triton import FlashAttentionTriton
+except ImportError:
+    FlashAttentionTriton = None  # type: ignore[misc, assignment]
+
 
 def get_flashattention_autograd_function_pytorch() -> Type:
     """
@@ -38,7 +43,10 @@ def get_flashattention_autograd_function_triton() -> Type:
     Returns:
         A class object (not an instance of the class)
     """
-    # For example: return MyTritonFlashAttentionAutogradFunctionClass
-    raise NotImplementedError
+    if FlashAttentionTriton is None:
+        raise NotImplementedError(
+            "student.flash_attention_triton.FlashAttentionTriton not found"
+        )
+    return FlashAttentionTriton
 
 
